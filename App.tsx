@@ -12,6 +12,9 @@ import { useTranslations } from './hooks/useTranslations';
 import { ScriptGeneratorPage } from './components/ScriptGeneratorPage';
 import { SettingsPage } from './components/SettingsPage';
 import { ApiConfigModal } from './components/ApiConfigModal';
+import AuthModal from './components/AuthModal';
+import { useAuth } from './hooks/useAuth';
+import { useDataSync } from './hooks/useDataSync';
 
 const initialMarketData: MarketDataEntry[] = [
     { id: '1', exchange: 'Binance', symbol: 'BTC/USDT', startDate: '2023-01-01', endDate: '2024-01-01', source: 'fetch', label: '2023 Full Year' },
@@ -62,13 +65,13 @@ const App: React.FC = () => {
   const [activeView, setActiveView] = useState<ActiveView>('script_generator');
   const { t } = useTranslations();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  
+
   const [backtestHistory, setBacktestHistory] = useState<BacktestHistoryEntry[]>(initialBacktestHistory);
   const [loadedHistoryEntry, setLoadedHistoryEntry] = useState<BacktestHistoryEntry | null>(null);
-  
+
   // State for Market Data Management
   const [marketDataEntries, setMarketDataEntries] = useState<MarketDataEntry[]>(initialMarketData);
-  
+
   // State for Script Generator Page (State Caching)
   const [scriptGeneratorPrompt, setScriptGeneratorPrompt] = useState<string>('');
   const [scriptGeneratorScript, setScriptGeneratorScript] = useState<string | null>(null);
@@ -76,36 +79,67 @@ const App: React.FC = () => {
   const [isSuggestionLoading, setIsSuggestionLoading] = useState<boolean>(false);
   const [suggestionLoadingAction, setSuggestionLoadingAction] = useState<'refine' | 'suggest' | null>(null);
   const [scriptGeneratorError, setScriptGeneratorError] = useState<string | null>(null);
-  
+
   // State for Backtester Page (State Caching)
   const [backtesterScript, setBacktesterScript] = useState<string>(samplePineScript);
   const [selectedMarketDataId, setSelectedMarketDataId] = useState<string | null>(null);
   const [isBacktesting, setIsBacktesting] = useState(false);
   const [backtestResults, setBacktestResults] = useState<BacktestSummary | null>(null);
-  
+
   // State for third-party LLM configs
   const [llmConfigs, setLlmConfigs] = useState<LlmConfig>({});
   const [activeProvider, setActiveProvider] = useState<LlmProvider | 'Gemini'>('Gemini');
-  
+
   // State for Exchange API configs
   const [exchangeApiConfigs, setExchangeApiConfigs] = useState<ExchangeApiConfigs>({});
   const [isApiConfigModalOpen, setIsApiConfigModalOpen] = useState(false);
 
+  // Authentication and Database Sync
+  const { user, loading: authLoading, signIn, signUp, signOut, isAuthenticated } = useAuth();
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const dataSync = useDataSync({ user, isAuthenticated });
 
+  // 加载数据：优先从数据库加载，否则从 localStorage
   useEffect(() => {
-    try {
-        const savedLlmConfigs = localStorage.getItem('llmApiConfigs');
-        if (savedLlmConfigs) {
+    const loadData = async () => {
+      if (isAuthenticated && user) {
+        // 从数据库加载
+        try {
+          const data = await dataSync.loadFromDatabase();
+          if (data) {
+            setLlmConfigs(data.llmConfigs);
+            setExchangeApiConfigs(data.exchangeConfigs);
+            if (data.marketData.length > 0) {
+              setMarketDataEntries(data.marketData);
+            }
+            if (data.backtestHistory.length > 0) {
+              setBacktestHistory(data.backtestHistory);
+            }
+          }
+        } catch (error) {
+          console.error("Failed to load data from database", error);
+        }
+      } else {
+        // 从 localStorage 加载（离线模式）
+        try {
+          const savedLlmConfigs = localStorage.getItem('llmApiConfigs');
+          if (savedLlmConfigs) {
             setLlmConfigs(JSON.parse(savedLlmConfigs));
-        }
-        const savedExchangeConfigs = localStorage.getItem('exchangeApiConfigs');
-        if (savedExchangeConfigs) {
+          }
+          const savedExchangeConfigs = localStorage.getItem('exchangeApiConfigs');
+          if (savedExchangeConfigs) {
             setExchangeApiConfigs(JSON.parse(savedExchangeConfigs));
+          }
+        } catch (error) {
+          console.error("Failed to load configs from localStorage", error);
         }
-    } catch (error) {
-        console.error("Failed to load configs from localStorage", error);
+      }
+    };
+
+    if (!authLoading) {
+      loadData();
     }
-  }, []);
+  }, [isAuthenticated, user, authLoading, dataSync]);
 
 
   const handleSetActiveView = useCallback((view: ActiveView) => {
@@ -118,8 +152,8 @@ const App: React.FC = () => {
   }, [activeView]);
 
   const handleAddMarketDataEntry = useCallback(async (newConfig: DataConfig, source: 'fetch' | 'import', fileName?: string) => {
-    return new Promise<void>(resolve => {
-        setTimeout(() => {
+    return new Promise<void>(async (resolve) => {
+        setTimeout(async () => {
             const newEntry: MarketDataEntry = {
                 id: `data-${Date.now()}`,
                 ...newConfig,
@@ -127,28 +161,56 @@ const App: React.FC = () => {
                 fileName,
             };
             setMarketDataEntries(prev => [newEntry, ...prev]);
+
+            // 同步到数据库
+            if (isAuthenticated) {
+              try {
+                await dataSync.syncMarketDataEntry(newEntry);
+              } catch (error) {
+                console.error('Failed to sync market data to database', error);
+              }
+            }
+
             resolve();
         }, 1000);
     });
-  }, []);
-  
-  const handleUpdateMarketDataLabel = useCallback((id: string, newLabel: string) => {
-    setMarketDataEntries(prev => 
-        prev.map(entry => 
-            entry.id === id 
+  }, [isAuthenticated, dataSync]);
+
+  const handleUpdateMarketDataLabel = useCallback(async (id: string, newLabel: string) => {
+    setMarketDataEntries(prev =>
+        prev.map(entry =>
+            entry.id === id
                 ? { ...entry, label: newLabel.trim() }
                 : entry
         )
     );
-  }, []);
+
+    // 同步到数据库
+    if (isAuthenticated) {
+      try {
+        await dataSync.syncUpdateMarketDataLabel(id, newLabel.trim());
+      } catch (error) {
+        console.error('Failed to sync market data label to database', error);
+      }
+    }
+  }, [isAuthenticated, dataSync]);
 
 
-  const handleDeleteMarketDataEntry = useCallback((id: string) => {
+  const handleDeleteMarketDataEntry = useCallback(async (id: string) => {
     setMarketDataEntries(prev => prev.filter(entry => entry.id !== id));
     if (selectedMarketDataId === id) {
         setSelectedMarketDataId(null);
     }
-  }, [selectedMarketDataId]);
+
+    // 同步到数据库
+    if (isAuthenticated) {
+      try {
+        await dataSync.syncDeleteMarketData(id);
+      } catch (error) {
+        console.error('Failed to delete market data from database', error);
+      }
+    }
+  }, [selectedMarketDataId, isAuthenticated, dataSync]);
 
   const handleGenerateStrategy = useCallback(async (request: StrategyRequest) => {
     setIsLoading(true);
@@ -165,7 +227,7 @@ const App: React.FC = () => {
       setIsLoading(false);
     }
   }, [t]);
-  
+
   const handleNewStrategy = () => {
     setStrategy(null);
     setError(null);
@@ -173,7 +235,7 @@ const App: React.FC = () => {
     setActiveView('generator');
   }
 
-  const handleSaveBacktest = useCallback((data: { script: string; dataSource: MarketDataEntry; results: BacktestSummary; }) => {
+  const handleSaveBacktest = useCallback(async (data: { script: string; dataSource: MarketDataEntry; results: BacktestSummary; }) => {
     const newEntry: BacktestHistoryEntry = {
         id: `hist-${Date.now()}`,
         name: `Backtest - ${new Date().toLocaleString()}`,
@@ -183,16 +245,34 @@ const App: React.FC = () => {
     setBacktestHistory(prev => [newEntry, ...prev]);
     // Immediately load the new entry to show it's saved and active
     setLoadedHistoryEntry(newEntry);
-  }, []);
 
-  const handleDeleteBacktest = useCallback((id: string) => {
+    // 同步到数据库
+    if (isAuthenticated) {
+      try {
+        await dataSync.syncBacktestHistory(newEntry);
+      } catch (error) {
+        console.error('Failed to sync backtest history to database', error);
+      }
+    }
+  }, [isAuthenticated, dataSync]);
+
+  const handleDeleteBacktest = useCallback(async (id: string) => {
       setBacktestHistory(prev => prev.filter(entry => entry.id !== id));
       if (loadedHistoryEntry?.id === id) {
-        setLoadedHistoryEntry(null); 
+        setLoadedHistoryEntry(null);
         setBacktesterScript(samplePineScript); // Reset to default
         setBacktestResults(null);
       }
-  }, [loadedHistoryEntry]);
+
+      // 同步到数据库
+      if (isAuthenticated) {
+        try {
+          await dataSync.syncDeleteBacktestHistory(id);
+        } catch (error) {
+          console.error('Failed to delete backtest history from database', error);
+        }
+      }
+  }, [loadedHistoryEntry, isAuthenticated, dataSync]);
 
   const handleUpdateBacktestName = useCallback((id: string, newName: string) => {
     setBacktestHistory(prev =>
@@ -219,7 +299,7 @@ const App: React.FC = () => {
         setActiveView('backtester');
     }
   }, [scriptGeneratorScript]);
-  
+
   const handleLoadStrategyInBacktester = useCallback((pineScript: string) => {
     setBacktesterScript(pineScript);
     setLoadedHistoryEntry(null); // Ensure we're not in "history view" mode
@@ -267,7 +347,7 @@ const App: React.FC = () => {
         setSuggestionLoadingAction(null);
     }
   }, [activeProvider, llmConfigs, t]);
-  
+
   const handleRefineStrategy = useCallback(async (userIdea: string) => {
     setIsSuggestionLoading(true);
     setSuggestionLoadingAction('refine');
@@ -295,7 +375,7 @@ const App: React.FC = () => {
 
     setIsBacktesting(true);
     setBacktestResults(null);
-    
+
     setTimeout(() => {
         const newResults: BacktestSummary = {
             pnl: `+${(Math.random() * 200).toFixed(1)}%`,
@@ -309,26 +389,52 @@ const App: React.FC = () => {
         handleSaveBacktest({ script: backtesterScript, dataSource: selectedData, results: newResults });
     }, 2500);
   }, [selectedMarketDataId, marketDataEntries, backtesterScript, handleSaveBacktest]);
-  
+
   // --- Handler for LLM Configs ---
-    const handleSaveLlmConfigs = useCallback((newConfigs: LlmConfig) => {
-        setLlmConfigs(newConfigs);
+  const handleSaveLlmConfigs = useCallback(async (newConfigs: LlmConfig) => {
+      setLlmConfigs(newConfigs);
+
+      // 保存到 localStorage（离线支持）
+      try {
+          localStorage.setItem('llmApiConfigs', JSON.stringify(newConfigs));
+      } catch (error) {
+          console.error("Failed to save LLM configs to localStorage", error);
+      }
+
+      // 同步到数据库
+      if (isAuthenticated) {
         try {
-            localStorage.setItem('llmApiConfigs', JSON.stringify(newConfigs));
+          for (const [provider, config] of Object.entries(newConfigs)) {
+            await dataSync.syncLlmConfig(provider, config);
+          }
         } catch (error) {
-            console.error("Failed to save LLM configs to localStorage", error);
+          console.error('Failed to sync LLM configs to database', error);
         }
-    }, []);
+      }
+  }, [isAuthenticated, dataSync]);
 
   // --- Handler for Exchange API Configs ---
-    const handleSaveExchangeApiConfigs = useCallback((newConfigs: ExchangeApiConfigs) => {
-        setExchangeApiConfigs(newConfigs);
+  const handleSaveExchangeApiConfigs = useCallback(async (newConfigs: ExchangeApiConfigs) => {
+      setExchangeApiConfigs(newConfigs);
+
+      // 保存到 localStorage（离线支持）
+      try {
+          localStorage.setItem('exchangeApiConfigs', JSON.stringify(newConfigs));
+      } catch (error) {
+          console.error("Failed to save exchange API configs to localStorage", error);
+      }
+
+      // 同步到数据库
+      if (isAuthenticated) {
         try {
-            localStorage.setItem('exchangeApiConfigs', JSON.stringify(newConfigs));
+          for (const [provider, config] of Object.entries(newConfigs)) {
+            await dataSync.syncExchangeConfig(provider, config);
+          }
         } catch (error) {
-            console.error("Failed to save exchange API configs to localStorage", error);
+          console.error('Failed to sync exchange configs to database', error);
         }
-    }, []);
+      }
+  }, [isAuthenticated, dataSync]);
 
 
   const renderActiveView = () => {
@@ -348,7 +454,7 @@ const App: React.FC = () => {
           </div>
         );
       case 'backtester':
-        return <BacktesterPage 
+        return <BacktesterPage
                     marketDataEntries={marketDataEntries}
                     selectedMarketDataId={selectedMarketDataId}
                     onSelectMarketData={setSelectedMarketDataId}
@@ -363,7 +469,7 @@ const App: React.FC = () => {
                     onRunBacktest={handleRunBacktest}
                />;
       case 'dataconfig':
-        return <DataConfigPage 
+        return <DataConfigPage
                   marketDataEntries={marketDataEntries}
                   onAddEntry={handleAddMarketDataEntry}
                   onDeleteEntry={handleDeleteMarketDataEntry}
@@ -395,11 +501,20 @@ const App: React.FC = () => {
     }
   }
 
+  // 显示加载状态
+  if (authLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-[#F9F9F7]">
+        <LoadingSpinner />
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen bg-[#F9F9F7] text-gray-800">
-      <Sidebar 
-        activeView={activeView} 
-        setActiveView={handleSetActiveView} 
+      <Sidebar
+        activeView={activeView}
+        setActiveView={handleSetActiveView}
         onNewStrategy={handleNewStrategy}
         isCollapsed={isSidebarCollapsed}
         onToggle={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
@@ -407,8 +522,64 @@ const App: React.FC = () => {
         onSelectHistory={handleSelectHistory}
         onOpenApiConfig={() => setIsApiConfigModalOpen(true)}
       />
-      
+
       <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
+        {/* 用户信息栏 */}
+        <div className="max-w-7xl mx-auto mb-4">
+          <div className="bg-white rounded-lg shadow-sm p-4 flex justify-between items-center">
+            <div className="flex items-center gap-3">
+              {isAuthenticated ? (
+                <>
+                  <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                  <span className="text-sm text-gray-600">
+                    已登录: <span className="font-medium text-gray-800">{user?.email}</span>
+                  </span>
+                  {dataSync.isSyncing && (
+                    <span className="text-xs text-blue-600 flex items-center gap-1">
+                      <svg className="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      同步中...
+                    </span>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="w-2 h-2 bg-gray-400 rounded-full"></div>
+                  <span className="text-sm text-gray-600">离线模式（数据仅保存在本地）</span>
+                </>
+              )}
+            </div>
+            <div className="flex gap-2">
+              {isAuthenticated ? (
+                <button
+                  onClick={signOut}
+                  className="px-4 py-2 text-sm bg-gray-200 hover:bg-gray-300 rounded-lg transition-colors font-medium"
+                >
+                  退出登录
+                </button>
+              ) : (
+                <button
+                  onClick={() => setIsAuthModalOpen(true)}
+                  className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors font-medium shadow-sm"
+                >
+                  登录 / 注册
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* 提示信息 */}
+          {!isAuthenticated && (
+            <div className="mt-3 bg-yellow-50 border border-yellow-200 rounded-lg p-3">
+              <p className="text-sm text-yellow-800">
+                💡 <strong>提示：</strong>登录后，你的数据将自动同步到云端，可在不同设备访问。
+              </p>
+            </div>
+          )}
+        </div>
+
         <div className="max-w-7xl mx-auto">
             {renderActiveView()}
         </div>
@@ -419,6 +590,13 @@ const App: React.FC = () => {
         onClose={() => setIsApiConfigModalOpen(false)}
         onSave={handleSaveExchangeApiConfigs}
         initialConfigs={exchangeApiConfigs}
+      />
+
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
+        onSignIn={signIn}
+        onSignUp={signUp}
       />
     </div>
   );
