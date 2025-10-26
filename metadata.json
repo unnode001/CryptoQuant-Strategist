@@ -1,0 +1,5 @@
+{
+  "name": "CryptoQuant Strategist",
+  "description": "An application for formulating cryptocurrency quantitative trading strategies using AI. Define your indicators and risk parameters to generate a custom trading strategy with backtesting insights and Pine Script code.",
+  "requestFramePermissions": []
+}
